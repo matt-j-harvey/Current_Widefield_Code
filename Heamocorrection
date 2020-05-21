@@ -1,0 +1,301 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import h5py
+import tables
+from scipy import signal, ndimage, stats
+from sklearn.linear_model import LinearRegression
+from skimage.morphology import white_tophat
+from PIL import Image
+from time import clock
+import os
+import cv2
+
+
+def load_arrays(video_file):
+    table = tables.open_file(video_file, mode='r')
+    blue_array = table.root.blue
+    violet_array = table.root.violet
+    
+    return blue_array, violet_array
+
+
+def get_chunk_structure(chunk_size, array_size):
+    
+    number_of_chunks = int(np.ceil(array_size / chunk_size))
+    remainder = array_size % chunk_size
+    
+    #Get Chunk Sizes
+    chunk_sizes = []
+    if remainder == 0:
+        for x in range(number_of_chunks):
+            chunk_sizes.append(chunk_size)
+            
+    else:
+        for x in range(number_of_chunks - 1):
+            chunk_sizes.append(chunk_size)
+        chunk_sizes.append(remainder)
+    
+    #Get Chunk Starts
+    chunk_starts = []
+    chunk_start = 0
+    for chunk_index in range(number_of_chunks):
+        chunk_starts.append(chunk_size * chunk_index)
+    
+    #Get Chunk Stops
+    chunk_stops = []
+    chunk_stop = 0
+    for chunk_index in range(number_of_chunks):
+        chunk_stop += chunk_sizes[chunk_index]
+        chunk_stops.append(chunk_stop)
+    
+    return number_of_chunks, chunk_sizes, chunk_starts, chunk_stops
+
+
+
+def restructure_data(array, output_directory):
+    print("Restructuring data")
+
+    number_of_images = np.shape(array)[0]                           #Calculate The Number of Images In The Raw Video File
+    number_of_pixels = np.shape(array)[1] * np.shape(array)[2]      #Calculate The Number of Pixels In The Raw Video File
+
+    preferred_chunk_size = 10000
+    number_of_chunks, chunk_sizes, chunk_starts, chunk_stops = get_chunk_structure(preferred_chunk_size, number_of_images)
+
+    with h5py.File(output_directory, "w") as f:
+        dataset = f.create_dataset("Data", (number_of_pixels, number_of_images), dtype=np.uint8, chunks=True, compression="gzip")
+
+        for chunk_index in range(number_of_chunks):
+            print("Chunk: ", chunk_index, " Of ", number_of_chunks)
+
+            chunk_size  = chunk_sizes[chunk_index]
+            chunk_start = chunk_starts[chunk_index]
+            chunk_stop  = chunk_stops[chunk_index]
+
+            data = array[chunk_start:chunk_stop]
+            data = np.moveaxis(data, [0, 1, 2],[2, 0, 1])
+
+            reshaped_data = np.ndarray.reshape(data, (number_of_pixels, chunk_size))
+            dataset[:, chunk_start:chunk_stop] = reshaped_data
+
+
+def get_max_projection(array):
+
+    image_shape = [np.shape(array)[1], np.shape(array)[2]]
+    number_of_pixels = np.shape(array)[1] * np.shape(array)[2]
+    current_max = np.zeros(number_of_pixels)
+
+    for file_index in range(500):
+        print(file_index)
+        file = array[file_index]
+        file = np.ndarray.flatten(file)
+        new_array = np.array([current_max, file])
+        current_max = np.max(new_array, axis=0)
+
+    max_projection = np.reshape(current_max, image_shape)
+    np.save(home_directory + "/max_projection", max_projection)
+
+    #plt.imshow(max_projection)
+    #plt.show()
+
+
+def get_mask(fraction):
+    image = np.load(home_directory + "/max_projection.npy")
+    image_shape = [np.shape(image)[0], np.shape(image[1])]
+
+    rows        = image_shape[0]
+    columns     = np.shape(image)[1]
+    max_value   = np.max(image)
+    min_value   = np.min(image)
+    mask        = np.zeros((rows, columns))
+    threshold = ((max_value - min_value) * fraction) + min_value
+
+    for y in range(rows):
+        for x in range(columns):
+            if image[y][x] > threshold:
+                mask[y][x] = 1
+
+
+    print("Active pixels: ", np.sum(mask))
+    #plt.imshow(mask)
+    #plt.show()
+    np.save(home_directory + "/Mask", mask)
+
+
+def process_traces(blue_data, violet_data):
+
+    # Perform Heamodyamic Correction
+    ratio = np.divide(blue_data, violet_data)
+    mean_ratio = np.mean(ratio, axis=1)
+
+    corrected_data = ratio / mean_ratio[:, None]
+
+    #Z Score
+    #normalised_data = stats.zscore(corrected_data, axis=1)
+    normalised_data = corrected_data
+
+    return normalised_data
+
+
+def process_pixels(blue_data, violet_data, output_file):
+    print("Processing Pixels")
+
+    # Load Mask:
+    mask = np.load(home_directory + "/Mask.npy")
+    flat_mask = np.ndarray.flatten(mask)
+
+    indicies = np.argwhere(flat_mask)
+    indicies = np.ndarray.astype(indicies, int)
+    indicies = np.ndarray.flatten(indicies)
+    indicies = list(indicies)
+
+    # Create Butterwoth Bandpass Filter
+    sampling_frequency = 25  # In Hertz
+    cutoff_frequency = 8.5  # In Hertz
+    w = cutoff_frequency / (sampling_frequency / 2)  # Normalised frequency
+    low_cutoff_frequency = 0.01
+    w_low = low_cutoff_frequency / (sampling_frequency / 2)
+    b, a = signal.butter(2, [w_low, w], 'bandpass')
+
+    # Load Data
+    blue_matrix     = h5py.File(blue_data, 'r')
+    violet_matrix   = h5py.File(violet_data, 'r')
+
+    number_of_pixels = np.shape(blue_matrix["Data"])[0]
+    number_of_images = np.shape(blue_matrix["Data"])[1]
+    number_of_active_pixels = np.sum(flat_mask)
+
+    print("number of pixels", number_of_pixels)
+    print("Number of active pixels", number_of_active_pixels)
+    print("Number of indicies", (len(indicies)))
+    print("Number of images", number_of_images)
+
+
+    # Define Chunking Settings
+    preferred_chunk_size = 10000
+    number_of_chunks, chunk_sizes, chunk_starts, chunk_stops = get_chunk_structure(preferred_chunk_size, number_of_active_pixels)
+
+
+    print("Number of chunks", number_of_chunks)
+    print("Chunk sizes", chunk_sizes)
+
+    with h5py.File(output_file, "w") as f:
+        dataset = f.create_dataset("Data", (number_of_active_pixels, number_of_images), dtype=np.float32, chunks=True, compression="gzip", compression_opts=9)
+
+        for chunk_index in range(number_of_chunks):
+            print("Chunk: ", chunk_index)
+            chunk_start = int(chunk_starts[chunk_index])
+            chunk_stop  = int(chunk_stops[chunk_index])
+
+            chunk_indicies = indicies[chunk_start:chunk_stop]
+            print(chunk_indicies)
+
+            blue_chunk   = blue_matrix["Data"][chunk_indicies]
+            violet_chunk = violet_matrix["Data"][chunk_indicies]
+
+            print("blue chunk shape", np.shape(blue_chunk))
+
+            processed_data = process_traces(blue_chunk, violet_chunk)
+            processed_data = signal.filtfilt(b, a, processed_data, axis=1)
+
+            dataset[chunk_start:chunk_stop, :] = processed_data
+
+
+def reconstruct_images(processed_file_location):
+
+    #Load Mask
+    mask = np.load(home_directory + "/Mask.npy")
+    flat_mask = np.ndarray.flatten(mask)
+
+    indicies = np.argwhere(flat_mask)
+    indicies = np.ndarray.astype(indicies, int)
+    indicies = np.ndarray.flatten(indicies)
+
+    # Load Processed Data
+    processed_data_file = h5py.File(processed_file_location, 'r')
+    processed_data = processed_data_file["Data"]
+    number_of_files = np.shape(processed_data)[1]
+    print("Number of files", number_of_files)
+
+    # Get Original Pixel Dimenions
+    frame_width = 608
+    frame_height = 600
+
+    chunk_size = 100
+    chunk_index = 0
+    image_index = 0
+
+    video_name = home_directory + "/Movie4.avi"
+    video_codec = cv2.VideoWriter_fourcc(*'DIVX')
+
+    video = cv2.VideoWriter(video_name, video_codec, frameSize=(frame_width, frame_height), fps=30)  # 0, 12
+
+    t_score_limit = 2
+    colourmap_vmin = 0.2
+    colourmap_vmax = 0.6
+    cm = plt.cm.ScalarMappable(norm=None, cmap='inferno')
+    cm.set_clim(vmin=colourmap_vmin, vmax=colourmap_vmax)
+
+    template = np.zeros((frame_height * frame_width))
+    while image_index < 100:#number_of_files:
+
+        start = chunk_index * chunk_size
+        stop = (chunk_index + 1) * chunk_size
+
+        storage_matrix = processed_data[:, start:stop]
+
+        #print(np.shape(storage_matrix))
+
+        for chunklet in range(chunk_size):
+            print("Image: ", image_index)
+
+            flat_pixels = storage_matrix[:, chunklet]
+            image = np.clip(flat_pixels, a_min=-t_score_limit, a_max=t_score_limit)
+            image = np.nan_to_num(image)
+            image = np.add(image, t_score_limit)
+            image = np.divide(image, 2*t_score_limit)
+
+            np.put(template, indicies, image)
+
+            image = np.reshape(template, (frame_height, frame_width))
+            image = ndimage.gaussian_filter(image, 6)
+
+            colored_image = cm.to_rgba(image)
+            colored_image = colored_image * 255
+            image = np.ndarray.astype(colored_image, np.uint8)
+
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            video.write(image)
+
+            image_index += 1
+        chunk_index += 1
+
+    cv2.destroyAllWindows()
+    video.release()
+
+
+
+def perform_heamocorrection(home_directory):
+    
+    #Assign File Location
+    video_file          = home_directory + "/widefield.h5"
+    blue_file           = home_directory + "/Blue_Data.hdf5"
+    violet_file         = home_directory + "/Violet_Data.hdf5"
+    processed_data_file = home_directory + "/Heamocorrected_Data_Masked.hdf5"
+
+    #Extract Array Data
+    blue_array, violet_array = load_arrays(video_file)
+
+    #Restructure Data
+    restructure_data(blue_array,    blue_file)
+    restructure_data(violet_array,  violet_file)
+
+    #Get Mask and Max Projection
+    get_max_projection(blue_array)
+    get_mask(0.1)
+
+    #Extract Signal
+    process_pixels(blue_file, violet_file, processed_data_file)
+
+    #Reconstruct Images
+    reconstruct_images(processed_data_file)
